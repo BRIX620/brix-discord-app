@@ -1,3 +1,4 @@
+
 """Brix Discord HTTP Interactions service."""
 
 from __future__ import annotations
@@ -11,7 +12,13 @@ from typing import Any
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    Header,
+    HTTPException,
+    Request,
+)
 from fastapi.responses import JSONResponse
 from nacl.exceptions import BadSignatureError
 from nacl.signing import VerifyKey
@@ -145,7 +152,7 @@ def response_data(
     *,
     ephemeral: bool,
 ) -> dict[str, Any]:
-    """Build an interaction response with mention notifications disabled."""
+    """Build a response while preventing mention notifications."""
     data: dict[str, Any] = {
         "content": content,
         "allowed_mentions": {"parse": []},
@@ -157,14 +164,17 @@ def response_data(
     return data
 
 
-async def send_public_followup(
+async def publish_message(
     *,
     application_id: str,
     interaction_token: str,
     content: str,
 ) -> None:
-    """Send a separate public follow-up to the interaction."""
-    url = (
+    """
+    Update the private deferred response, then try to create
+    a separate public follow-up message.
+    """
+    webhook_url = (
         f"{DISCORD_API_BASE}/webhooks/"
         f"{application_id}/{interaction_token}"
     )
@@ -172,14 +182,37 @@ async def send_public_followup(
     async with httpx.AsyncClient(
         timeout=DISCORD_API_TIMEOUT_SECONDS,
     ) as client:
-        response = await client.post(
-            url,
+        # Replace the private "thinking" response with a confirmation.
+        original_response = await client.patch(
+            f"{webhook_url}/messages/@original",
+            json={
+                "content": "Sending your message...",
+                "allowed_mentions": {"parse": []},
+            },
+        )
+        original_response.raise_for_status()
+
+        # Create a separate follow-up message without the ephemeral flag.
+        public_response = await client.post(
+            webhook_url,
             json={
                 "content": content,
                 "allowed_mentions": {"parse": []},
             },
         )
-        response.raise_for_status()
+        public_response.raise_for_status()
+
+        # Update the private confirmation after Discord accepts the post.
+        confirmation = await client.patch(
+            f"{webhook_url}/messages/@original",
+            json={
+                "content": "Message sent.",
+                "allowed_mentions": {"parse": []},
+            },
+        )
+        confirmation.raise_for_status()
+
+    logger.info("Brix public follow-up accepted by Discord.")
 
 
 def create_app(
@@ -214,7 +247,7 @@ def create_app(
             if not token:
                 raise RuntimeError(
                     "DISCORD_BOT_TOKEN is missing. "
-                    "Set it in your hosting provider's environment variables."
+                    "Set it in your hosting environment variables."
                 )
 
             try:
@@ -231,7 +264,7 @@ def create_app(
                 status = exc.response.status_code
                 logger.error(
                     "Discord setup failed with HTTP %s. "
-                    "Check the bot token and application configuration.",
+                    "Check the bot token and application settings.",
                     status,
                 )
                 raise RuntimeError(
@@ -278,6 +311,7 @@ def create_app(
 
     @application.post(f"{route_prefix}/interactions")
     async def interactions(
+        background_tasks: BackgroundTasks,
         request: Request,
         signature: str | None = Header(
             default=None,
@@ -397,8 +431,14 @@ def create_app(
                 }
             )
 
-        # Acknowledge privately first. The follow-up is sent separately.
-        # Discord may still associate it with the slash-command interaction.
+        # Acknowledge promptly, then publish in a background task.
+        background_tasks.add_task(
+            publish_message,
+            application_id=application_id,
+            interaction_token=interaction_token,
+            content=message,
+        )
+
         return JSONResponse(
             {
                 "type": 5,
